@@ -1122,8 +1122,13 @@ curl -s -i -X POST http://localhost:8080/api/compare \
   条目**互异**（重复为 422），**可以指向尚未登记（任何图都没有）的来源或列**——此时不产生影响；
 * **OR 语义**：某源列只要被图内 `sensitive: true` **或**名录命中，即按敏感处理，二者取并集；
 * **代次（generation）**：名录初始为空、generation 为 `0`；成功整份替换一次加一；
-* **随名录变化**：名录替换成功后，服务**重审全部登记图**，并把**名录、代次和每张图的新结论
-  在同一事务里一起保存**（任何失败整体回滚，名录与结论不会出现新旧混搭）；
+* **随名录变化**：名录替换成功后，服务**重审全部登记图**，并把**名录、加一后的代次和每张图的新结论
+  在同一事务里一起保存**（任何写入或提交失败都整体回滚到替换前状态：不会留下“新名录 + 旧代次”
+  或只有部分图结论更新的中间状态）；
+* **失败可安全重试**：替换以 **HTTP 500 `INTERNAL`** 失败（写库异常等）后，名录、代次和全部图结论
+  仍是替换前那一版，数据库重开也不变；`GET /api/sensitive-columns`、`GET /api/graphs/{id}` 与按 ID
+  预演读到、放行所依据的都是同一份旧状态。由于代次没有前进，故障解除后用**原来的 expected_generation
+  重新提交即可**成功（不会冲突、不会重复加一）；
 * **持久化**：登记图、名录、代次与审查结论保存在 SQLite（默认 `data/export-risk.db`，可用
   环境变量 `RISK_API_DB` 覆盖）；Docker 部署时数据库位于 Compose **命名卷**上，容器重启后
   登记图与名录仍然可用。
@@ -1140,7 +1145,7 @@ curl -s -i -X POST http://localhost:8080/api/compare \
 | `GET` | `/api/graphs/{id}` | 读取登记图：返回**原始 `nodes`/`export`**、当前 `generation`（结论所对应的代次）与该代次下的 `review`；未知 ID 返回 **404** `GRAPH_NOT_FOUND` |
 | `POST` | `/api/graphs/{id}/preview` | 按图 ID 预演，请求体**只含 `rows`、`conditions`**（形状与规则同 `/api/preview`）。复用全部原预演规则（覆盖、键集合、标量、200 行上限等）；放行以**当前审查结论**为准：阻断时返回 **400** `PREVIEW_BLOCKED`，错误体**不含任何样本数据**；成功返回样本并带当前 `generation`；未知 ID 返回 **404** `GRAPH_NOT_FOUND` |
 | `GET` | `/api/sensitive-columns` | 读取当前名录：`{"generation": N, "entries": [...]}`（条目按提交顺序） |
-| `PUT` | `/api/sensitive-columns` | **整份替换**名录：`{"entries": [...], "expected_generation": N}`，条目互异、可空（清空）。`expected_generation` 与当前代次不符时返回 **409** `GENERATION_CONFLICT`（带 `expected_generation`/`current_generation`），不做任何修改；成功时代次加一、重审全部登记图，并返回新代次、新名录与每张图的新结论 `reviews`（按图 ID） |
+| `PUT` | `/api/sensitive-columns` | **整份替换**名录：`{"entries": [...], "expected_generation": N}`，条目互异、可空（清空）。`expected_generation` 与当前代次不符时返回 **409** `GENERATION_CONFLICT`（带 `expected_generation`/`current_generation`），不做任何修改；成功时代次加一、重审全部登记图，并返回新代次、新名录与每张图的新结论 `reviews`（按图 ID）。任何写库异常（含提交失败）返回 **500** `INTERNAL` 且**整体回滚**——名录、代次与全部图结论保持替换前状态，可用原代次重试 |
 
 ### 并发次序
 
@@ -1241,6 +1246,66 @@ curl -s -X POST http://localhost:8080/api/graphs/$GID/preview \
 }'
 # {"...rows":[[1,"a@x.example","ALL"]],...,"generation":2}
 ```
+
+### 替换失败后的读取、预演与重新提交
+
+名录、加一后的代次和全部图结论在**同一 SQLite 事务**里保存：任何一条写入失败、甚至最后的
+`COMMIT` 本身失败，整次替换都回滚，磁盘上仍是替换前的完整状态（不依赖进程存活，重启或数据库
+重开后同样是旧状态）。失败的请求返回：
+
+```text
+HTTP/1.1 500
+{"error":{"code":"INTERNAL","message":"..."}}
+```
+
+> 与代次过期不同：过期代次返回 **409** `GENERATION_CONFLICT`，是调用方的预期冲突；500
+> `INTERNAL` 表示服务端写库异常，此时**什么都没改**。
+
+假设上面的第 3 步（期望代次 `0`，写入 `users.email`）在服务端写库中途或提交时失败，则故障期间
+与故障解除后都可以这样确认状态、继续使用并重试：
+
+```bash
+# 1) 失败后读名录：仍是旧代次 0、空名录（不是半成品的新名录）
+curl -s http://localhost:8080/api/sensitive-columns
+# {"generation":0,"entries":[]}
+
+# 2) 读登记图：结论与代次都停在替换前（blocked 仍为 false、generation 仍为 0）
+curl -s http://localhost:8080/api/graphs/$GID
+# {"id":"...","nodes":[...],"export":"export_users","generation":0,
+#  "review":{"blocked":false,...}}
+
+# 3) 按 ID 预演仍按同一份旧结论放行：返回样本数据，generation 为 0
+curl -s -X POST http://localhost:8080/api/graphs/$GID/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "rows": {"users": [{"uid": 1, "email": "a@x.example", "country": "CN"}]},
+  "conditions": {"only_cn": {"country": "CN"}}
+}'
+# {"...rows":[[1,"a@x.example","ALL"]],...,"generation":0}
+```
+
+故障解除（磁盘恢复等）后，**不需要先 GET 再换 expected_generation**——代次没有前进，原请求体
+原样重发即可；成功后只加一代，全部图结论一次性更新：
+
+```bash
+# 4) 用原来的 expected_generation（0）重新提交同一份名录
+curl -s -X PUT http://localhost:8080/api/sensitive-columns \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "entries": [{"source": "users", "column": "email"}],
+  "expected_generation": 0
+}'
+# {"generation":1,"entries":[{"source":"users","column":"email"}],
+#  "reviews":{"<图ID>":{"blocked":true,...}}}
+
+# 5) 再读一次：名录、代次、图结论已一致地更新为新状态
+curl -s http://localhost:8080/api/sensitive-columns   # generation 为 1
+curl -s http://localhost:8080/api/graphs/$GID         # generation 1、blocked true
+# 此时若再拿过期的代次 0 提交，仍按原行为返回 409，什么都不改
+```
+
+即使失败发生在服务重启期间，重启后第一步读到的也仍是旧状态；上面对 `$GID` 的读取、预演与重新
+提交顺序完全适用。
 
 其他行为：
 

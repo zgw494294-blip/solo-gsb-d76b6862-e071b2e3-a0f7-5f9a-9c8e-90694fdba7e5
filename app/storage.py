@@ -22,6 +22,7 @@ import json
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
 from typing import Optional
 
 # Default database location inside the container; docker-compose mounts a named
@@ -74,6 +75,31 @@ class Store:
         with self.lock:
             self._conn.close()
 
+    @contextmanager
+    def _transaction(self):
+        """Run a block in one explicit transaction.
+
+        The connection is in autocommit mode (``isolation_level=None``), where
+        ``with conn`` does *not* open a transaction: without an explicit
+        ``BEGIN`` every statement commits on its own and a failure midway leaves
+        earlier statements persisted. ``BEGIN IMMEDIATE`` takes the write lock
+        up front; any exception from the block *or from ``COMMIT`` itself* rolls
+        every statement back, so the database is left exactly as it was.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            self._conn.execute("COMMIT")
+        except BaseException:
+            try:
+                self._conn.execute("ROLLBACK")
+            except Exception:
+                # The original failure is what callers must see; if the
+                # rollback cannot be expressed (e.g. the connection is dead),
+                # SQLite itself keeps the uncommitted transaction off disk.
+                pass
+            raise
+
     # --------------------------------------------------------------- meta --
 
     def _init_meta(self) -> None:
@@ -117,7 +143,11 @@ class Store:
         the *new* registry. The caller has already computed the reviews, so the
         transaction itself never runs review logic.
         """
-        with self._conn:  # commits on success, rolls back on any exception
+        # Explicit transaction: in autocommit mode a plain ``with self._conn``
+        # would not open one, and a failure after the DELETE (or at COMMIT)
+        # would leave the new entries, the old generation and half-updated
+        # conclusions on disk. Any failure rolls the whole replacement back.
+        with self._transaction():
             self._conn.execute("DELETE FROM sensitive_entries")
             self._conn.executemany(
                 "INSERT INTO sensitive_entries "

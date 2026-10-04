@@ -273,6 +273,206 @@ def test_failed_rereview_changes_nothing(monkeypatch):
     assert reg == {"generation": 0, "entries": []}
 
 
+# ----------------- failed writes roll the whole replacement -----------------
+#
+# The connection runs in autocommit mode (isolation_level=None), where a plain
+# ``with conn`` never opens a transaction; the replacement therefore has to run
+# in one explicit transaction, or a failure after some statements would leave
+# the new entries with the old generation and only some conclusions updated.
+# Faults are injected through a forwarding connection wrapper -- sqlite3's
+# built-in Connection attributes cannot be monkeypatched.
+
+
+class _FaultyConnection:
+    """Forward to the real SQLite connection, raising once on a chosen SQL."""
+
+    def __init__(self, raw, should_fail, message):
+        self._raw = raw
+        self._should_fail = should_fail
+        self._message = message
+        self.fired = False
+
+    def execute(self, sql, params=()):
+        if not self.fired and self._should_fail(sql):
+            self.fired = True
+            raise RuntimeError(self._message)
+        return self._raw.execute(sql, params)
+
+    def executemany(self, sql, parameters):
+        return self._raw.executemany(sql, parameters)
+
+    def close(self):
+        return self._raw.close()
+
+
+# Requests that hit the global exception handler must surface as 500/INTERNAL;
+# a client that re-raises server exceptions cannot observe that response.
+fault_client = TestClient(app, raise_server_exceptions=False)
+
+SECOND_GRAPH = {
+    "nodes": [{"id": "s2", "type": "source",
+               "columns": [{"name": "x", "sensitive": False}]}],
+    "export": "s2",
+}
+
+
+def _two_graphs():
+    g1 = register()["id"]
+    g2 = client.post("/api/graphs", json=SECOND_GRAPH).json()["id"]
+    assert g1 != g2
+    return g1, g2
+
+
+def _fault_put(entries, generation=0):
+    return fault_client.put(
+        "/api/sensitive-columns",
+        json={"entries": entries, "expected_generation": generation},
+    )
+
+
+def _install_fault(predicate, message="simulated database failure"):
+    db = get_store()
+    raw = db._conn
+    faulty = _FaultyConnection(raw, predicate, message)
+    db._conn = faulty
+    return raw, faulty
+
+
+def _assert_old_state(g1, g2, blocked_g1=False, blocked_g2=False,
+                      generation=0, entries=()):
+    """Everything reads back as the committed pre-failure state."""
+    reg = client.get("/api/sensitive-columns").json()
+    assert reg["generation"] == generation
+    assert [(e["source"], e["column"]) for e in reg["entries"]] == list(entries)
+    for gid, was_blocked in ((g1, blocked_g1), (g2, blocked_g2)):
+        got = client.get(f"/api/graphs/{gid}").json()
+        assert got["generation"] == generation
+        assert got["review"]["blocked"] is was_blocked
+    # The preview is gated on the same old conclusion, so the safe graph still
+    # returns its sample rows under the old generation.
+    resp = client.post(
+        f"/api/graphs/{g1}/preview",
+        json={"rows": ROWS, "conditions": CONDITIONS},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["generation"] == generation
+    assert resp.json()["rows"] == [[1, "a@x.example", "ALL"]]
+
+
+def test_write_failure_midway_rolls_back_entries_and_generation():
+    g1, g2 = _two_graphs()
+    # Fail right after the new entries have been written, before generation or
+    # any conclusion is touched (the DELETE/INSERT batch runs first).
+    raw, faulty = _install_fault(lambda sql: sql.startswith("UPDATE meta"))
+    resp = _fault_put(
+        [{"source": "users", "column": "email"},
+         {"source": "s2", "column": "x"}])
+    assert resp.status_code == 500
+    assert resp.json()["error"]["code"] == "INTERNAL"
+    assert faulty.fired
+    get_store()._conn = raw
+
+    # GET registry, GET graph and the by-id preview all keep the old state.
+    _assert_old_state(g1, g2)
+    # And the same (old) generation can replace again, successfully.
+    assert put_registry([{"source": "users", "column": "email"}], 0).status_code == 200
+    assert client.get("/api/sensitive-columns").json()["generation"] == 1
+
+
+def test_write_failure_after_some_conclusions_updates_nothing():
+    g1, g2 = _two_graphs()
+    # Graph conclusions are written one UPDATE per graph: let the first land,
+    # then fail, so without a transaction one graph would carry the new
+    # conclusion while the other kept the old one.
+    seen = {"updates": 0}
+
+    def fail_on_second_graph_update(sql):
+        if sql.startswith("UPDATE graphs"):
+            seen["updates"] += 1
+            return seen["updates"] == 2
+        return False
+
+    raw, faulty = _install_fault(fail_on_second_graph_update)
+    resp = _fault_put(
+        [{"source": "users", "column": "email"},
+         {"source": "s2", "column": "x"}])
+    assert resp.status_code == 500
+    assert resp.json()["error"]["code"] == "INTERNAL"
+    assert faulty.fired
+    assert seen["updates"] == 2  # the first UPDATE really ran before the fault
+    get_store()._conn = raw
+
+    # Neither conclusion moved, entries and generation are the old ones.
+    _assert_old_state(g1, g2)
+    # Retrying with the unchanged generation 0 commits exactly once.
+    body = put_registry(
+        [{"source": "users", "column": "email"},
+         {"source": "s2", "column": "x"}], 0).json()
+    assert body["generation"] == 1
+    assert body["reviews"][g1]["blocked"] is True
+    assert body["reviews"][g2]["blocked"] is True
+    # A stale replay is still rejected, confirming there was no double increment.
+    assert put_registry([], 0).status_code == 409
+
+
+def test_commit_failure_rolls_the_whole_replacement_back():
+    g1, g2 = _two_graphs()
+    # Every statement succeeds; only COMMIT fails.
+    raw, faulty = _install_fault(
+        lambda sql: sql.strip().upper() == "COMMIT", "commit failed")
+    resp = _fault_put([{"source": "users", "column": "email"}])
+    assert resp.status_code == 500
+    assert resp.json()["error"]["code"] == "INTERNAL"
+    assert faulty.fired
+    get_store()._conn = raw
+
+    _assert_old_state(g1, g2)
+    assert put_registry([{"source": "users", "column": "email"}], 0).status_code == 200
+    assert client.get("/api/sensitive-columns").json()["generation"] == 1
+
+
+def test_rolled_back_failure_state_survives_reopen_and_replaces_again(tmp_path):
+    db_path = str(tmp_path / "rollback-persist.db")
+    reset_store(db_path)
+    g1, g2 = _two_graphs()
+
+    raw, faulty = _install_fault(
+        lambda sql: sql.strip().upper() == "COMMIT", "commit failed")
+    resp = _fault_put(
+        [{"source": "users", "column": "email"},
+         {"source": "s2", "column": "x"}])
+    assert resp.status_code == 500
+    assert faulty.fired
+    get_store()._conn = raw
+
+    # Reopen the same database file: the rolled-back state must be on disk.
+    reset_store(db_path)
+    reg = client.get("/api/sensitive-columns").json()
+    assert reg == {"generation": 0, "entries": []}
+    for gid in (g1, g2):
+        got = client.get(f"/api/graphs/{gid}").json()
+        assert got["generation"] == 0
+        assert got["review"]["blocked"] is False
+
+    # After the restart the original generation still replaces exactly once.
+    assert put_registry(
+        [{"source": "users", "column": "email"}], 0).status_code == 200
+    assert client.get("/api/sensitive-columns").json()["generation"] == 1
+    assert client.get(f"/api/graphs/{g1}").json()["review"]["blocked"] is True
+
+    # And that committed replacement is itself durable across another reopen.
+    reset_store(db_path)
+    reg = client.get("/api/sensitive-columns").json()
+    assert reg["generation"] == 1
+    assert reg["entries"] == [{"source": "users", "column": "email"}]
+    got = client.get(f"/api/graphs/{g1}").json()
+    assert got["generation"] == 1
+    assert got["review"]["blocked"] is True
+    got2 = client.get(f"/api/graphs/{g2}").json()
+    assert got2["generation"] == 1
+    assert got2["review"]["blocked"] is False
+
+
 # ------------------------------ previews -----------------------------------
 
 
