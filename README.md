@@ -1123,7 +1123,9 @@ curl -s -i -X POST http://localhost:8080/api/compare \
 * **OR 语义**：某源列只要被图内 `sensitive: true` **或**名录命中，即按敏感处理，二者取并集；
 * **代次（generation）**：名录初始为空、generation 为 `0`；成功整份替换一次加一；
 * **随名录变化**：名录替换成功后，服务**重审全部登记图**，并把**名录、代次和每张图的新结论
-  在同一事务里一起保存**（任何失败整体回滚，名录与结论不会出现新旧混搭）；
+  在同一事务里一起保存**；写入中途或提交失败都会**整体回滚**——名录、代次与全部结论保持
+  旧值，重开数据库后也不变，故障解除后可用原 `expected_generation` 重试，
+  见下文“替换失败：整体回滚与重试”；
 * **持久化**：登记图、名录、代次与审查结论保存在 SQLite（默认 `data/export-risk.db`，可用
   环境变量 `RISK_API_DB` 覆盖）；Docker 部署时数据库位于 Compose **命名卷**上，容器重启后
   登记图与名录仍然可用。
@@ -1140,7 +1142,7 @@ curl -s -i -X POST http://localhost:8080/api/compare \
 | `GET` | `/api/graphs/{id}` | 读取登记图：返回**原始 `nodes`/`export`**、当前 `generation`（结论所对应的代次）与该代次下的 `review`；未知 ID 返回 **404** `GRAPH_NOT_FOUND` |
 | `POST` | `/api/graphs/{id}/preview` | 按图 ID 预演，请求体**只含 `rows`、`conditions`**（形状与规则同 `/api/preview`）。复用全部原预演规则（覆盖、键集合、标量、200 行上限等）；放行以**当前审查结论**为准：阻断时返回 **400** `PREVIEW_BLOCKED`，错误体**不含任何样本数据**；成功返回样本并带当前 `generation`；未知 ID 返回 **404** `GRAPH_NOT_FOUND` |
 | `GET` | `/api/sensitive-columns` | 读取当前名录：`{"generation": N, "entries": [...]}`（条目按提交顺序） |
-| `PUT` | `/api/sensitive-columns` | **整份替换**名录：`{"entries": [...], "expected_generation": N}`，条目互异、可空（清空）。`expected_generation` 与当前代次不符时返回 **409** `GENERATION_CONFLICT`（带 `expected_generation`/`current_generation`），不做任何修改；成功时代次加一、重审全部登记图，并返回新代次、新名录与每张图的新结论 `reviews`（按图 ID） |
+| `PUT` | `/api/sensitive-columns` | **整份替换**名录：`{"entries": [...], "expected_generation": N}`，条目互异、可空（清空）。`expected_generation` 与当前代次不符时返回 **409** `GENERATION_CONFLICT`（带 `expected_generation`/`current_generation`），不做任何修改；成功时代次加一、重审全部登记图，并返回新代次、新名录与每张图的新结论 `reviews`（按图 ID）；写库异常返回 **500** `INTERNAL`，名录、代次与结论全部保持旧值 |
 
 ### 并发次序
 
@@ -1148,6 +1150,52 @@ curl -s -i -X POST http://localhost:8080/api/compare \
 发生在替换之前（旧名录 + 旧结论），要么完全发生在替换之后（新名录 + 新结论），绝不会用
 “新名录 + 旧结论”或“旧名录 + 新结论”放行；替换完成之后，任何凭替换前安全结论发起的预演都
 不能再返回样本数据。
+
+### 替换失败：整体回滚与重试
+
+一次替换要么**全部生效**（新名录 + 加一的代次 + 全部登记图的新结论），要么**什么都不改**。
+写入中途或提交失败（例如磁盘/命名卷故障）时，服务返回 **500** `INTERNAL`，且不留任何
+半成品：名录、代次与每张图的结论保持旧值，重开数据库（或重启容器）后依然如此；失败后的
+读取与按 ID 预演都沿用这同一旧状态，故障解除后用**原 `expected_generation`** 重新提交即可：
+
+```bash
+# 替换因写库故障失败：500，错误码 INTERNAL（什么都不改）
+curl -s -i -X PUT http://localhost:8080/api/sensitive-columns \
+  -H 'Content-Type: application/json' \
+  -d '{"entries": [{"source": "users", "column": "email"}],
+       "expected_generation": 0}'
+# HTTP/1.1 500 ... {"error":{"code":"INTERNAL","message":"..."}}
+```
+
+```bash
+# 失败后读取：名录与代次仍是旧值（本例仍为空、代次 0）
+curl -s http://localhost:8080/api/sensitive-columns
+# {"generation":0,"entries":[]}
+
+# 登记图仍是旧代次下的旧结论
+curl -s http://localhost:8080/api/graphs/$GID
+# {"id":"...","nodes":[...],"export":"export_users",
+#  "generation":0,"review":{"blocked":false,...}}
+
+# 按 ID 预演沿用同一旧结论放行/拦截（本例旧结论安全，照常返回样本）
+curl -s -X POST http://localhost:8080/api/graphs/$GID/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "rows": {"users": [{"uid": 1, "email": "a@x.example", "country": "CN"}]},
+  "conditions": {"only_cn": {"country": "CN"}}
+}'
+# {"...rows":[[1,"a@x.example","ALL"]],...,"generation":0}
+```
+
+```bash
+# 故障解除后：用原 expected_generation 重新提交，替换照常成功
+curl -s -X PUT http://localhost:8080/api/sensitive-columns \
+  -H 'Content-Type: application/json' \
+  -d '{"entries": [{"source": "users", "column": "email"}],
+       "expected_generation": 0}'
+# {"generation":1,"entries":[{"source":"users","column":"email"}],
+#  "reviews":{"<图ID>":{"export":"export_users","blocked":true,...}}}
+```
 
 ### curl 走一遍：登记 → 标敏感后预演被拒 → 清空后恢复
 
@@ -1316,10 +1364,10 @@ python -m pytest tests/ -q
 app/models.py     请求模型与结构约束（Pydantic；含 ReviseRequest、PruneRequest、RenameRequest、ComposeRequest、PreviewRequest、CompareRequest，以及 GraphRegisterRequest、GraphPreviewRequest、SensitiveColumnsReplaceRequest）
 app/engine.py     图校验、拓扑排序、来源传播（图内标记 ∪ 名录的 OR 敏感集）、逐列审查、安全修订、按列精简、源列批量改名、上下游拼接、小样本预演与两版导出风险对照
 app/registry.py   登记图/按图预演/名录读取与整份替换：锁内取快照、重审全部登记图、世代冲突
-app/storage.py    SQLite 持久化（名录与 generation、登记图原图与审查结论；替换与结论同事务提交）
+app/storage.py    SQLite 持久化（名录与 generation、登记图原图与审查结论；替换与结论在同一显式事务提交，写入/提交失败整体回滚）
 app/main.py       FastAPI 入口（/api/review、/api/revise、/api/prune、/api/rename、/api/compose、/api/preview、/api/compare、/api/graphs、/api/graphs/{id}、/api/graphs/{id}/preview、/api/sensitive-columns、/health）
 examples/         请求示例（request.json、revise_request.json、prune_request.json、rename_request.json、compose_request.json、preview_request.json、compare_request.json）
-tests/            传播规则、拒绝场景、修订/复审、精简、改名、拼接、预演、两版对照，以及登记图/名录/代次/并发次序/SQLite 持久化测试
+tests/            传播规则、拒绝场景、修订/复审、精简、改名、拼接、预演、两版对照，以及登记图/名录/代次/并发次序/替换失败回滚/SQLite 持久化测试
 Dockerfile        容器镜像（python:3.11-slim，暴露 8080）
 docker-compose.yml 单命令编排（命名卷 export-risk-data 持久化 /data/export-risk.db）
 ```

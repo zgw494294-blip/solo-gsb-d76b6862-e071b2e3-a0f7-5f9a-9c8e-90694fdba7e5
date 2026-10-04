@@ -11,9 +11,10 @@ Two pieces of state survive restarts:
 
 All reads and writes of the in-process state go through one lock, and a
 replacement persists the new entries, the new generation and every graph's new
-review result in a single SQLite transaction: either the whole change commits
-or nothing at all changes, so a registry can never be observed together with
-stale conclusions.
+review result in a single explicit SQLite transaction: either the whole change
+commits or nothing at all changes, so a registry can never be observed
+together with stale conclusions — not even after a write or commit failure,
+and not after the database is reopened.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import json
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
 from typing import Optional
 
 # Default database location inside the container; docker-compose mounts a named
@@ -74,6 +76,33 @@ class Store:
         with self.lock:
             self._conn.close()
 
+    # -------------------------------------------------------- transactions --
+
+    @contextmanager
+    def _transaction(self):
+        """Run a batch of writes as one atomic unit.
+
+        The connection runs in autocommit mode (``isolation_level=None``), so
+        without an explicit ``BEGIN`` every statement would commit on its own
+        and a failure halfway through would leave a partial state behind
+        (e.g. new entries next to the old generation). Here the whole batch
+        commits together; any failure — including a failed ``COMMIT`` — rolls
+        everything back to the exact pre-batch state.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self._conn.rollback()
+            raise
+        try:
+            self._conn.commit()
+        except BaseException:
+            # A failed commit can leave the transaction open; make sure the
+            # partial work is discarded rather than lingering uncommitted.
+            self._conn.rollback()
+            raise
+
     # --------------------------------------------------------------- meta --
 
     def _init_meta(self) -> None:
@@ -114,10 +143,13 @@ class Store:
         """Persist entries + generation + every graph's review atomically.
 
         ``graph_reviews`` maps every registered graph id to its review under
-        the *new* registry. The caller has already computed the reviews, so the
-        transaction itself never runs review logic.
+        the *new* registry. The caller has already computed the reviews, so
+        the transaction itself never runs review logic. Any write or commit
+        failure rolls the whole replacement back: entries, generation and
+        every stored conclusion stay exactly as they were — including after
+        the database is closed and reopened.
         """
-        with self._conn:  # commits on success, rolls back on any exception
+        with self._transaction():
             self._conn.execute("DELETE FROM sensitive_entries")
             self._conn.executemany(
                 "INSERT INTO sensitive_entries "
